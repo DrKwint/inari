@@ -1,78 +1,78 @@
-# Copyright 2019 DeepMind Technologies Limited. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""Experiment loop."""
-
-import haiku as hk
+import functools
+from inari.cqdn import CQDN
+import safety_gym
+import gym
 import jax
+from flax import linen as nn
+import gin
+from jax import numpy as jnp
+import rlax
+from dopamine.replay_memory.prioritized_replay_buffer import OutOfGraphPrioritizedReplayBuffer
+import numpy as np
+from flax import linen as nn
+import gin
+import jax
+from tqdm import tqdm
+import tensorflow as tf
 
 
-def run_loop(agent, environment, accumulator, seed, batch_size, train_episodes,
-             evaluate_every, eval_episodes):
-    """A simple run loop for examples of reinforcement learning with rlax."""
+class CDQNNetwork(nn.Module):
+    num_layers: int = 2
+    hidden_units: int = 128
 
-    # Init agent.
-    rng = hk.PRNGSequence(jax.random.PRNGKey(seed))
-    params = agent.initial_params(next(rng))
-    learner_state = agent.initial_learner_state(params)
+    @nn.compact
+    def __call__(self, state: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
+        kernel_initializer = jax.nn.initializers.glorot_uniform()
 
-    print(f"Training agent for {train_episodes} episodes")
-    for episode in range(train_episodes):
+        # Preprocess inputs
+        a = action.reshape(-1)  # flatten
+        s = state.astype(jnp.float32)
+        s = state.reshape(-1)  # flatten
+        x = jnp.concatenate((s, a))
 
-        # Prepare agent, environment and accumulator for a new episode.
-        timestep = environment.reset()
-        accumulator.push(timestep, None)
-        actor_state = agent.initial_actor_state()
+        for _ in range(self.num_layers):
+            x = nn.Dense(features=self.hidden_units,
+                         kernel_init=kernel_initializer)(x)
+            x = nn.relu(x)
 
-        while not timestep.last():
+        return nn.Dense(features=1, kernel_init=kernel_initializer)(x)
 
-            # Acting.
-            actor_output, actor_state = agent.actor_step(params,
-                                                         timestep,
-                                                         actor_state,
-                                                         next(rng),
-                                                         evaluation=False)
 
-            # Agent-environment interaction.
-            action = int(actor_output.actions)
-            timestep = environment.step(action)
+def run_agent(seed=0):
+    gin.parse_config_file('./inari/cdqn.gin')
+    robot = 'point'.capitalize()
+    task = 'goal1'.capitalize()
+    env_name = 'Safexp-' + robot + task + '-v0'
+    env = gym.make(env_name)
+    obs_shape = env.observation_space.shape
+    act_shape = env.action_space.shape
 
-            # Accumulate experience.
-            accumulator.push(timestep, action)
+    rng = jax.random.PRNGKey(seed)
+    cdqn = CQDN(CDQNNetwork, obs_shape, act_shape, base_dir='./tests/')
 
-            # Learning.
-            if accumulator.is_ready(batch_size):
-                params, learner_state = agent.learner_step(
-                    params, accumulator.sample(batch_size), learner_state,
-                    next(rng))
+    obs = env.reset()
+    done = False
+    for epoch in range(10):
+        epoch_ep_rewards = []
+        cum_ep_reward = 0
+        for step in tqdm(range(30000)):
+            rng, local_rng = jax.random.split(rng)
+            act, est_q = cdqn.select_action(obs, local_rng)
+            obs, rew, done, info = env.step(act)
+            cost = info['cost']
+            cum_ep_reward += rew
+            cdqn.store_transition(obs, np.array(act), rew, done)
+            cdqn.train_step()
+            if done:
+                with cdqn.summary_writer.as_default():
+                    tf.summary.scalar("ep_reward",
+                                      cum_ep_reward,
+                                      step=epoch * 30000 + step)
+                obs = env.reset()
+                epoch_ep_rewards.append(cum_ep_reward)
+                cum_ep_reward = 0
+        print("Mean episode reward:", np.mean(epoch_ep_rewards))
 
-        # Evaluation.
-        if not episode % evaluate_every:
-            returns = 0.
-            for _ in range(eval_episodes):
-                timestep = environment.reset()
-                actor_state = agent.initial_actor_state()
 
-                while not timestep.last():
-                    actor_output, actor_state = agent.actor_step(
-                        params,
-                        timestep,
-                        actor_state,
-                        next(rng),
-                        evaluation=True)
-                    timestep = environment.step(int(actor_output.actions))
-                    returns += timestep.reward
-
-            avg_returns = returns / eval_episodes
-            print(f"Episode {episode:4d}: Average returns: {avg_returns:.2f}")
+if __name__ == '__main__':
+    run_agent()

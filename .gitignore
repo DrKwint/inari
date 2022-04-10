@@ -1,0 +1,6 @@
+env/
+tests/
+*.egg-info
+*.pyc
+*.swp
+settings.json
