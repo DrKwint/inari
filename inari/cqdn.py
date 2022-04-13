@@ -1,18 +1,17 @@
 import collections
-import pathlib
-from typing import Any, Tuple
-import tensorflow as tf
 import functools
-import jax
-import gin
-from jax import numpy as jnp
-import dopamine.replay_memory.prioritized_replay_buffer as prioritized_replay_buffer
-import numpy as np
-import dopamine.jax.losses as losses
-import optax
 import logging
+from typing import Any, Tuple
+
+import dopamine.jax.losses as losses
+import dopamine.replay_memory.prioritized_replay_buffer as prioritized_replay_buffer
+import gin
+import jax
+import numpy as np
+import optax
+import tensorflow as tf
 from jax import lax
-from tqdm import tqdm
+from jax import numpy as jnp
 
 
 @gin.configurable
@@ -51,12 +50,32 @@ def create_optimizer(name='adam',
         raise ValueError('Unsupported optimizer {}'.format(name))
 
 
+@gin.configurable
+@functools.partial(jax.jit, static_argnums=(0, 2, 3))
+def linearly_decaying_epsilon(decay_period, step, warmup_steps, epsilon):
+    """Returns the current epsilon for the agent's epsilon-greedy policy.
+    This follows the Nature DQN schedule of a linearly decaying epsilon (Mnih et
+    al., 2015). The schedule is as follows:
+        Begin at 1. until warmup_steps steps have been taken; then
+        Linearly decay epsilon from 1. to epsilon in decay_period steps; and then
+        Use epsilon from there on.
+    Args:
+        decay_period: float, the period over which epsilon is decayed.
+        step: int, the number of training steps completed so far.
+        warmup_steps: int, the number of steps taken before epsilon is decayed.
+        epsilon: float, the final value to which to decay the epsilon parameter.
+    Returns:
+        A float, the current epsilon value computed according to the schedule.
+    """
+    steps_left = decay_period + warmup_steps - step
+    bonus = (1.0 - epsilon) * steps_left / decay_period
+    bonus = jnp.clip(bonus, 0., 1. - epsilon)
+    return epsilon + bonus
+
+
 @functools.partial(jax.jit, static_argnums=(0, 4))
-def select_max_q_action(network_def,
-                        params,
-                        state: jnp.ndarray,
-                        action_init: jnp.ndarray,
-                        max_steps=1000):
+def select_max_q_action(network_def, params, state: jnp.ndarray,
+                        action_init: jnp.ndarray, search_steps: int):
     neg_q_fn = lambda a: -1 * network_def.apply(params, state, a)[0]
 
     @jax.jit
@@ -73,17 +92,17 @@ def select_max_q_action(network_def,
     opt_state = optimizer.init(action_init)
     carry, step_losses = lax.scan(step, (action_init, opt_state),
                                   None,
-                                  length=max_steps,
-                                  unroll=100)
+                                  length=search_steps,
+                                  unroll=search_steps)
     action, _ = carry
     action = jnp.clip(action, -5, 5)
     q = network_def.apply(params, state, action)[0]
     return action, q
 
 
-@functools.partial(jax.jit, static_argnums=(0))
+@functools.partial(jax.jit, static_argnums=(0, 8))
 def target_q(network_def, online_params, target_params, next_states, rewards,
-             terminals, actions, cumulative_gamma):
+             terminals, actions, cumulative_gamma, search_steps):
     """Compute the target Q-value."""
 
     def q_target(state, action):
@@ -92,7 +111,7 @@ def target_q(network_def, online_params, target_params, next_states, rewards,
     select_q = functools.partial(select_max_q_action,
                                  network_def=network_def,
                                  params=online_params,
-                                 max_steps=100)
+                                 search_steps=search_steps)
     # Do the DDQN thing of selecting the next q with online params
     # and evaluate its q-value with target params
     next_actions = jax.vmap(select_q)(state=next_states,
@@ -111,7 +130,7 @@ def target_q(network_def, online_params, target_params, next_states, rewards,
                                  (1. - terminals))
 
 
-@functools.partial(jax.jit, static_argnums=(0, 3, 11, 12))
+@functools.partial(jax.jit, static_argnums=(0, 3, 11, 12, 13))
 def train(network_def,
           online_params,
           target_params,
@@ -124,6 +143,7 @@ def train(network_def,
           rewards,
           terminals,
           cumulative_gamma,
+          search_steps,
           loss_type='huber'):
     """Run the training step."""
 
@@ -140,7 +160,7 @@ def train(network_def,
 
     target = target_q(network_def, online_params, target_params,
                       jnp.squeeze(next_states), rewards, terminals, actions,
-                      cumulative_gamma)
+                      cumulative_gamma, search_steps)
     grad_fn = jax.value_and_grad(loss_fn)
     loss, grad = grad_fn(online_params, target)
     updates, optimizer_state = optimizer.update(grad,
@@ -150,22 +170,31 @@ def train(network_def,
     return optimizer_state, online_params, loss
 
 
-class CQDN():
+@gin.configurable
+class CDQN():
 
     def __init__(self,
                  network,
                  observation_shape,
                  action_shape,
-                 base_dir,
                  rng,
-                 gamma=0.99,
-                 update_horizon=1,
-                 min_replay_history=5000,
-                 update_period=4,
-                 target_update_period=5000,
-                 summary_writing_frequency=500,
+                 num_search_steps,
+                 epsilon_fn=linearly_decaying_epsilon,
+                 epsilon_train=0.05,
+                 epsilon_eval=0.001,
+                 epsilon_decay_period=1000000,
                  optimizer='adam',
                  loss_type='huber',
+                 gamma=0.99,
+                 update_horizon=1,
+                 update_period=2,
+                 min_replay_history=5000,
+                 target_update_period=5000,
+                 batch_size=32,
+                 replay_capacity=1000000,
+                 base_dir=None,
+                 checkpoint_dir=None,
+                 summary_writing_frequency=500,
                  observation_dtype=np.float32,
                  action_dtype=np.float32):
         self.network_def = network()
@@ -179,13 +208,15 @@ class CQDN():
         self.min_replay_history = min_replay_history
         self.update_period = update_period
         self.target_update_period = target_update_period
+        self.num_search_steps = num_search_steps
+        self.epsilon_fn = epsilon_fn
+        self.epsilon_train = epsilon_train
+        self.epsilon_eval = epsilon_eval
+        self.epsilon_decay_period = epsilon_decay_period
         self._optimizer_name = optimizer
         self._loss_type = loss_type
-        self._replay = self._build_replay_buffer()
-        self.summary_writer = tf.summary.create_file_writer(
-            str(
-                pathlib.Path(base_dir) /
-                'update_freq={}'.format(update_period)))
+        self._replay = self._build_replay_buffer(batch_size, replay_capacity)
+        self.summary_writer = tf.summary.create_file_writer('.')
         self.summary_writing_frequency = summary_writing_frequency
 
         self.training_steps = 0
@@ -205,22 +236,23 @@ class CQDN():
         self.optimizer_state = self.optimizer.init(self.online_params)
         self.target_network_params = self.online_params
 
-    def select_action(self,
-                      state,
-                      last_action,
-                      rng,
-                      epsilon,
-                      max_steps=100) -> Tuple[jnp.ndarray, float]:
+    def select_action(self, state, last_action) -> Tuple[jnp.ndarray, float]:
         action, q = select_max_q_action(self.network_def, self.online_params,
-                                        state, last_action, max_steps)
-        coin_flip_rng, noise_rng = jax.random.split(rng)
+                                        state, last_action,
+                                        self.num_search_steps)
+        epsilon = self.epsilon_fn(self.epsilon_decay_period,
+                                  self.training_steps, self.min_replay_history,
+                                  self.epsilon_train)
+        self._rng, coin_flip_rng, noise_rng = jax.random.split(self._rng, 3)
         if jax.random.bernoulli(coin_flip_rng, epsilon):
             action += jax.random.normal(noise_rng, action.shape)
         return action
 
-    def _build_replay_buffer(self):
+    def _build_replay_buffer(self, batch_size, replay_capacity):
         """Creates the replay buffer used by the agent."""
         return prioritized_replay_buffer.OutOfGraphPrioritizedReplayBuffer(
+            batch_size=batch_size,
+            replay_capacity=replay_capacity,
             observation_shape=self.observation_shape,
             observation_dtype=self.observation_dtype,
             action_shape=self.action_shape,
@@ -304,6 +336,7 @@ class CQDN():
                     rewards=self.replay_elements['reward'],
                     terminals=self.replay_elements['terminal'],
                     cumulative_gamma=self.cumulative_gamma,
+                    search_steps=self.num_search_steps,
                     loss_type=self._loss_type)
                 if (self.summary_writer is not None and self.training_steps > 0
                         and self.training_steps %
@@ -347,10 +380,8 @@ class CQDN():
             params = optax.apply_updates(params, updates)
             return params, opt_state, loss_value
 
-        print("Pre-train")
-        for _ in tqdm(range(num_steps)):
+        for _ in range(num_steps):
             self._rng, step_rng = jax.random.split(self._rng)
             self.online_params, opt_state, loss_value = step(
                 self.online_params, opt_state, step_rng)
-            print(loss_value)
         self.target_network_params = self.online_params
