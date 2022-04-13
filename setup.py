@@ -21,5 +21,6 @@ setup(
         'tensorflow>=2.8.0',
         'gym>=0.23.1',
         'jinja2>=3.1.1',
+        'tqdm>=4.64.0'
     ],
 )

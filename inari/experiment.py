@@ -1,4 +1,4 @@
-from inari.cqdn import CQDN
+from inari.cqdn import CDQN
 import safety_gym
 import gym
 import jax
@@ -31,34 +31,29 @@ class CDQNNetwork(nn.Module):
         x = jnp.concatenate((s, a))
 
         for _ in range(self.num_layers):
-            x = nn.Dense(features=self.hidden_units,
-                         kernel_init=kernel_initializer)(x)
+            x = nn.Dense(features=self.hidden_units, kernel_init=kernel_initializer)(x)
             x = nn.relu(x)
 
         return nn.Dense(features=1, kernel_init=kernel_initializer)(x)
 
 
 def run_agent(seed=0):
-    gin.parse_config_file('./inari/cdqn.gin')
+    gin.parse_config_file("./inari/cdqn.gin")
 
     random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
     rng = jax.random.PRNGKey(seed)
     tf.random.set_seed(seed)
     np.random.seed(seed)
 
-    robot = 'point'.capitalize()
-    task = 'goal1'.capitalize()
-    env_name = 'Safexp-' + robot + task + '-v0'
+    robot = "point".capitalize()
+    task = "goal1".capitalize()
+    env_name = "Safexp-" + robot + task + "-v0"
     env = gym.make(env_name)
     obs_shape = env.observation_space.shape
     act_shape = env.action_space.shape
 
-    cdqn = CQDN(CDQNNetwork,
-                obs_shape,
-                act_shape,
-                base_dir='./tests/',
-                rng=rng)
+    cdqn = CDQN(CDQNNetwork, obs_shape, act_shape, base_dir="./tests/", rng=rng)
 
     obs = env.reset()
     act = np.zeros(act_shape)
@@ -72,22 +67,24 @@ def run_agent(seed=0):
                 act = cdqn.select_action(obs, act, action_sample_rng, 0.25)
                 prev_obs = obs
                 obs, rew, done, info = env.step(act)
-                cost = info['cost']
+                cost = info["cost"]
                 cum_ep_reward += rew
                 cdqn.store_transition(prev_obs, np.array(act), rew, done)
                 cdqn.train_step()
-                tf.summary.scalar("act_magnitude",
-                                  np.sqrt(np.sum(np.square(act))),
-                                  step=epoch * 30000 + step)
+                tf.summary.scalar(
+                    "act_magnitude",
+                    np.sqrt(np.sum(np.square(act))),
+                    step=epoch * 30000 + step,
+                )
                 if done:
-                    tf.summary.scalar("ep_reward",
-                                      cum_ep_reward,
-                                      step=epoch * 30000 + step)
+                    tf.summary.scalar(
+                        "ep_reward", cum_ep_reward, step=epoch * 30000 + step
+                    )
                     obs = env.reset()
                     epoch_ep_rewards.append(cum_ep_reward)
                     cum_ep_reward = 0
         print("Mean episode reward:", np.mean(epoch_ep_rewards))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     run_agent()
