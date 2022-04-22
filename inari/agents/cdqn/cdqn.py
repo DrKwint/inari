@@ -452,11 +452,27 @@ class CDQN:
         online_params: Any,
         target_params: Any,
         next_states: Any,
-        rewards,
-        terminals,
-        actions,
-        cumulative_gamma,
-    ):
+        rewards: Any,
+        terminals: Any,
+        actions: Any,
+        cumulative_gamma: float,
+    ) -> Any:
+        """
+        Get the target Q value
+
+        Args:
+            network (Any): Network being trained
+            online_params (Any): Online parameters of the network
+            target_params (Any): Target network parameters
+            next_states (Any): States obtained from replay buffer to train over
+            rewards (Any): Rewards obtained from replay buffer to train over
+            terminals (Any): Flags indicating whether the state was terminal
+            actions (Any): Actions obtained from replay buffer to train over
+            cumulative_gamma (float): Cumulative discount factor
+
+        Returns:
+            Any: Bellman target Q value
+        """
         def q_target(state, action):
             return network.apply(target_params, state, action)[0]
 
@@ -488,31 +504,55 @@ class CDQN:
     @partial(jax.jit, static_argnums=(0,))
     def train(
         self,
-        network,
-        online_params,
-        target_params,
-        optimizer,
-        optimizer_state,
-        rng,
-        states,
-        actions,
-        next_states,
-        rewards,
-        terminals,
-        cumulative_gamma,
-        loss_type="huber",
-    ):
+        network: Any,
+        online_params: Any,
+        target_params: Any,
+        optimizer: Any,
+        optimizer_state: Any,
+        rng: Any,
+        states: Any,
+        actions: Any,
+        next_states: Any,
+        rewards: Any,
+        terminals: Any,
+        cumulative_gamma: float,
+        loss_type: str="huber",
+    ) -> tuple:
+        """
+        Train the policy
+
+        Args:
+            network (Any): The network to train
+            online_params (Any): Online parameters of the network
+            target_params (Any): Network target parameters
+            optimizer (Any): Optimizer to use for search
+            optimizer_state (Any): Current state of the optimizer
+            rng (Any): PRNG Key
+            states (Any): States obtained from replay buffer to train over
+            actions (Any): Actions obtained from replay buffer to train over
+            next_states (Any): States obtained from replay buffer to train over
+            rewards (Any): Rewards obtained from replay buffer to train over
+            terminals (Any): Flags indicating whether the state was terminal
+            cumulative_gamma (float): Cumulative discount factor
+            loss_type (str, optional): The method of measureing loss. Defaults to 
+                "huber".
+
+        Returns:
+            tuple: Optimizer state, online params, loss
+        """
         # Define a loss function to use for training
         def loss_fn(params, target):
             def q_online(state, action):
                 return network.apply(params, state, action)[0]
 
             replay_chosen_q = jax.vmap(q_online)(states, actions)
+
             if loss_type == "huber":
                 return jnp.mean(jax.vmap(losses.huber_loss)(target, replay_chosen_q))
 
             return jnp.mean(jax.vmap(losses.mse_loss)(target, replay_chosen_q))
 
+        # Get the target Q value
         target = self.__target_q(
             network,
             online_params,
