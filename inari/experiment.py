@@ -20,14 +20,14 @@ def run_agent(config, checkpoint_dir=None):
     # seed everything
     seed = 0
     random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
     rng = jax.random.PRNGKey(seed)
     tf.random.set_seed(seed)
     np.random.seed(seed)
 
-    robot = 'point'.capitalize()
-    task = 'goal1'.capitalize()
-    env_name = 'Safexp-' + robot + task + '-v0'
+    robot = "point".capitalize()
+    task = "goal1".capitalize()
+    env_name = "Safexp-" + robot + task + "-v0"
     env = gym.make(env_name)
     obs_shape = env.observation_space.shape
     act_shape = env.action_space.shape
