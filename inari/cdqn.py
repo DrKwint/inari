@@ -5,6 +5,7 @@ from typing import Any, Tuple
 
 import dopamine.jax.losses as losses
 import dopamine.replay_memory.prioritized_replay_buffer as prioritized_replay_buffer
+from dopamine.replay_memory.circular_replay_buffer import ReplayElement
 import gin
 import jax
 import numpy as np
@@ -12,6 +13,7 @@ import optax
 import tensorflow as tf
 from jax import lax
 from jax import numpy as jnp
+from flax import linen as nn
 
 
 @gin.configurable
@@ -74,17 +76,25 @@ def linearly_decaying_epsilon(decay_period, step, warmup_steps, epsilon):
 
 
 @functools.partial(jax.jit, static_argnums=(0, 4))
-def select_max_q_action(network_def, params, state: jnp.ndarray,
-                        action_init: jnp.ndarray, search_steps: int):
-    neg_q_fn = lambda a: -1 * network_def.apply(params, state, a)[0]
+def select_max_q_action(network_def,
+                        params,
+                        state: jnp.ndarray,
+                        action_init: jnp.ndarray,
+                        search_steps: int,
+                        cost_coeff: float = 0.):
+    #neg_q_fn = lambda a: -1 * network_def.apply(params, state, a)[0]
+    def loss_fn(a):
+        q_r, q_c = network_def.apply(params, state, a, cost_coeff)
+        return (-q_r + cost_coeff * q_c) * (1 / (1 + cost_coeff))
 
     @jax.jit
     def step(carry: Tuple[jnp.ndarray, jnp.ndarray],
              step_input: Any) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], Any]:
         action, opt_state = carry
-        loss, grads = jax.value_and_grad(neg_q_fn)(action)
+        loss, grads = jax.value_and_grad(loss_fn)(action)
         updates, opt_state = optimizer.update(grads, opt_state, action)
         action = optax.apply_updates(action, updates)
+        action = jnp.clip(action, -5, 5)
         carry = action, opt_state
         return carry, loss
 
@@ -95,29 +105,31 @@ def select_max_q_action(network_def, params, state: jnp.ndarray,
                                   length=search_steps,
                                   unroll=search_steps)
     action, _ = carry
-    action = jnp.clip(action, -5, 5)
-    q = network_def.apply(params, state, action)[0]
+    q = network_def.apply(params, state, action, cost_coeff)
     return action, q
 
 
 @functools.partial(jax.jit, static_argnums=(0, 8))
 def target_q(network_def, online_params, target_params, next_states, rewards,
-             terminals, actions, cumulative_gamma, search_steps):
+             terminals, actions, cumulative_gamma, search_steps, costs,
+             cost_coeff):
     """Compute the target Q-value."""
 
     def q_target(state, action):
-        return network_def.apply(target_params, state, action)[0]
+        return network_def.apply(target_params, state, action, cost_coeff)
 
     select_q = functools.partial(select_max_q_action,
                                  network_def=network_def,
                                  params=online_params,
-                                 search_steps=search_steps)
+                                 search_steps=search_steps,
+                                 cost_coeff=cost_coeff)
     # Do the DDQN thing of selecting the next q with online params
     # and evaluate its q-value with target params
     next_actions = jax.vmap(select_q)(state=next_states,
                                       action_init=actions)[0]
     q_vals = jax.vmap(q_target)(state=next_states, action=next_actions)
-    replay_next_qt_max = q_vals
+    rew_replay_next_qt_max = q_vals[:, 0]
+    cst_replay_next_qt_max = q_vals[:, 1]
     # Calculate the Bellman target value.
     #   Q_t = R_t + \gamma^N * Q'_t+1
     # where,
@@ -125,9 +137,11 @@ def target_q(network_def, online_params, target_params, next_states, rewards,
     #          (or) 0 if S_t is a terminal state,
     # and
     #   N is the update horizon (by default, N=1).
-    return jax.lax.stop_gradient(rewards +
-                                 cumulative_gamma * replay_next_qt_max *
-                                 (1. - terminals))
+    return jax.lax.stop_gradient(
+        rewards + cumulative_gamma * rew_replay_next_qt_max *
+        (1. - terminals)), jax.lax.stop_gradient(costs + cumulative_gamma *
+                                                 cst_replay_next_qt_max *
+                                                 (1. - terminals))
 
 
 @functools.partial(jax.jit, static_argnums=(0, 3, 11, 12, 13))
@@ -144,30 +158,44 @@ def train(network_def,
           terminals,
           cumulative_gamma,
           search_steps,
-          loss_type='huber'):
+          loss_type='huber',
+          costs=None,
+          c_loss_coeff=0.25,
+          cost_penalty=0.):
     """Run the training step."""
 
-    def loss_fn(params, target):
+    def loss_fn(params, r_target, c_target):
 
         def q_online(state, action):
-            return network_def.apply(params, state, action)[0]
+            return network_def.apply(params, state, action, cost_penalty)
 
         replay_chosen_q = jax.vmap(q_online)(states, actions)
+        r_replay_chosen_q = replay_chosen_q[:, 0]
+        c_replay_chosen_q = replay_chosen_q[:, 1]
         if loss_type == 'huber':
             return jnp.mean(
-                jax.vmap(losses.huber_loss)(target, replay_chosen_q))
-        return jnp.mean(jax.vmap(losses.mse_loss)(target, replay_chosen_q))
+                jax.vmap(losses.huber_loss)(
+                    r_target, r_replay_chosen_q)), c_loss_coeff * jnp.mean(
+                        jax.vmap(losses.huber_loss)(c_target,
+                                                    c_replay_chosen_q))
+        return jnp.mean(
+            jax.vmap(losses.mse_loss)(
+                r_target, r_replay_chosen_q)), c_loss_coeff * jnp.mean(
+                    jax.vmap(losses.mse_loss)(c_target, c_replay_chosen_q))
 
-    target = target_q(network_def, online_params, target_params,
-                      jnp.squeeze(next_states), rewards, terminals, actions,
-                      cumulative_gamma, search_steps)
-    grad_fn = jax.value_and_grad(loss_fn)
-    loss, grad = grad_fn(online_params, target)
+    r_target, c_target = target_q(network_def, online_params, target_params,
+                                  jnp.squeeze(next_states), rewards, terminals,
+                                  actions, cumulative_gamma, search_steps,
+                                  costs, cost_penalty)
+    grad_fn = jax.value_and_grad(lambda params, r_target, c_target: jnp.sum(
+        jnp.array(loss_fn(params, r_target, c_target))))
+    loss, grad = grad_fn(online_params, r_target, c_target)
+    r_loss, c_loss = loss_fn(online_params, r_target, c_target)
     updates, optimizer_state = optimizer.update(grad,
                                                 optimizer_state,
                                                 params=online_params)
     online_params = optax.apply_updates(online_params, updates)
-    return optimizer_state, online_params, loss
+    return optimizer_state, online_params, loss, r_loss, c_loss / c_loss_coeff
 
 
 @gin.configurable
@@ -190,14 +218,15 @@ class CDQN():
                  update_period=2,
                  min_replay_history=5000,
                  target_update_period=5000,
-                 batch_size=32,
+                 batch_size=64,
                  replay_capacity=1000000,
+                 cost_penalty_init=0.,
                  base_dir=None,
                  checkpoint_dir=None,
                  summary_writing_frequency=500,
                  observation_dtype=np.float32,
                  action_dtype=np.float32):
-        self.network_def = network()
+        self.network_def = network
         self.observation_shape = observation_shape
         self.observation_dtype = observation_dtype
         self.action_shape = action_shape
@@ -213,11 +242,16 @@ class CDQN():
         self.epsilon_train = epsilon_train
         self.epsilon_eval = epsilon_eval
         self.epsilon_decay_period = epsilon_decay_period
+        self.cost_penalty = cost_penalty_init
         self._optimizer_name = optimizer
         self._loss_type = loss_type
         self._replay = self._build_replay_buffer(batch_size, replay_capacity)
         self.summary_writer = tf.summary.create_file_writer('.')
         self.summary_writing_frequency = summary_writing_frequency
+
+        self.lambd = 0.
+        self.pid_prev_cost = 0.
+        self.pid_integral = 0.
 
         self.training_steps = 0
         self.eval_mode = False
@@ -227,26 +261,43 @@ class CDQN():
         self._build_networks_and_optimizer()
         self._pre_train()
 
+    def pid_update(self, cost: float, p_param: float, i_param: float,
+                   d_param: float, cost_limit: float):
+        delta = cost - cost_limit
+        print("delta:", delta)
+        partial = nn.relu(cost - self.pid_prev_cost)
+        print("partial:", partial)
+        self.pid_integral = nn.relu(self.pid_integral + delta)
+        print("integral:", self.pid_integral)
+        self.cost_penalty = nn.relu(p_param * delta +
+                                    i_param * self.pid_integral +
+                                    d_param * partial)
+        print("cost_penalty:", self.cost_penalty)
+        self.pid_prev_cost = cost
+        return self.cost_penalty
+
     def _build_networks_and_optimizer(self):
         self._rng, rng = jax.random.split(self._rng)
         self.online_params = self.network_def.init(rngs={'params': rng},
                                                    state=self.state,
-                                                   action=self.action)
+                                                   action=self.action,
+                                                   lambd=0.)
         self.optimizer = create_optimizer(self._optimizer_name)
         self.optimizer_state = self.optimizer.init(self.online_params)
         self.target_network_params = self.online_params
 
     def select_action(self, state, last_action) -> Tuple[jnp.ndarray, float]:
-        action, q = select_max_q_action(self.network_def, self.online_params,
-                                        state, last_action,
-                                        self.num_search_steps)
+        action, est_q = select_max_q_action(self.network_def,
+                                            self.online_params, state,
+                                            last_action, self.num_search_steps,
+                                            self.cost_penalty)
         epsilon = self.epsilon_fn(self.epsilon_decay_period,
                                   self.training_steps, self.min_replay_history,
                                   self.epsilon_train)
         self._rng, coin_flip_rng, noise_rng = jax.random.split(self._rng, 3)
         if jax.random.bernoulli(coin_flip_rng, epsilon):
-            action += jax.random.normal(noise_rng, action.shape)
-        return action
+            action += 0.5 * jax.random.normal(noise_rng, action.shape)
+        return action, est_q
 
     def _build_replay_buffer(self, batch_size, replay_capacity):
         """Creates the replay buffer used by the agent."""
@@ -259,6 +310,7 @@ class CDQN():
             action_dtype=self.action_dtype,
             stack_size=1,
             update_horizon=self.update_horizon,
+            extra_storage_types=[ReplayElement('cost', (), float)],
             gamma=self.gamma,
             reward_shape=(),
             terminal_dtype=bool)
@@ -323,7 +375,7 @@ class CDQN():
                 self._sample_from_replay_buffer()
 
                 self._rng, train_rng = jax.random.split(self._rng)
-                self.optimizer_state, self.online_params, loss = train(
+                self.optimizer_state, self.online_params, loss, r_loss, c_loss = train(
                     network_def=self.network_def,
                     online_params=self.online_params,
                     target_params=self.target_network_params,
@@ -337,13 +389,21 @@ class CDQN():
                     terminals=self.replay_elements['terminal'],
                     cumulative_gamma=self.cumulative_gamma,
                     search_steps=self.num_search_steps,
-                    loss_type=self._loss_type)
+                    loss_type=self._loss_type,
+                    costs=self.replay_elements['cost'],
+                    cost_penalty=self.cost_penalty)
                 if (self.summary_writer is not None and self.training_steps > 0
                         and self.training_steps %
                         self.summary_writing_frequency == 0):
                     with self.summary_writer.as_default():
-                        tf.summary.scalar(self._loss_type,
+                        tf.summary.scalar("train/" + self._loss_type,
                                           loss,
+                                          step=self.training_steps)
+                        tf.summary.scalar('train/reward_q_loss',
+                                          r_loss,
+                                          step=self.training_steps)
+                        tf.summary.scalar("train/cost_q_loss",
+                                          c_loss,
                                           step=self.training_steps)
             if self.training_steps % self.target_update_period == 0:
                 self._sync_weights()
@@ -360,21 +420,23 @@ class CDQN():
     def _pre_train(self, num_steps=100000):
         opt_state = self.optimizer.init(self.online_params)
 
-        loss = lambda params, obs, act: jnp.mean(
+        loss = lambda params, obs, act, lambd: jnp.mean(
             losses.mse_loss(
                 -1 * jnp.sqrt(jnp.sum(jnp.square(act), axis=-1)),
-                jax.vmap(lambda o, a: self.network_def.apply(params, o, a)[0])
-                (obs, act)))
+                jax.vmap(lambda o, a: self.network_def.apply(
+                    params, o, a, lambd)[0])(obs, act)))
 
         @jax.jit
         def step(params, opt_state, rng):
-            state_rng, action_rng = jax.random.split(rng)
+            state_rng, action_rng, lambd_rng = jax.random.split(rng, num=3)
             batch_obs = 10. * jax.random.normal(
                 state_rng, (128, ) + self.observation_shape)
             batch_act = 10. * jax.random.normal(action_rng,
                                                 (128, ) + self.action_shape)
+            batch_lambd = jax.random.normal(lambd_rng, ())
             loss_value, grads = jax.value_and_grad(loss)(params, batch_obs,
-                                                         batch_act)
+                                                         batch_act,
+                                                         batch_lambd)
             updates, opt_state = self.optimizer.update(grads, opt_state,
                                                        params)
             params = optax.apply_updates(params, updates)

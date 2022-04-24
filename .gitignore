@@ -4,3 +4,4 @@ tests/
 *.pyc
 *.swp
 settings.json
+ray_results/
