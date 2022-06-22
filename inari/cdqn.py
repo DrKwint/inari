@@ -55,7 +55,7 @@ def select_max_q_action(q_network,
                         state: jnp.ndarray,
                         rng,
                         action_shape,
-                        max_steps=100):
+                        max_steps=10):
     q_fn = lambda a: q_network(state, a)
 
     @jax.jit
@@ -138,7 +138,7 @@ def train(network_def,
     return optimizer_state, online_params, loss
 
 
-class CQDN():
+class CDQN():
 
     def __init__(self,
                  network,
@@ -216,6 +216,8 @@ class CQDN():
             action_shape=self.action_shape,
             action_dtype=self.action_dtype,
             stack_size=1,
+            batch_size=32,
+            replay_capacity=1000000,
             update_horizon=self.update_horizon,
             gamma=self.gamma,
             reward_shape=(),
